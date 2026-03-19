@@ -1,4 +1,4 @@
-# Spanner-Lite: Sharded Distributed Key-Value Store 🌐
+# Spanner-Lite: Sharded Distributed Key-Value Store 
 
 A sharded, linearizable key/value storage system built from scratch in Go, heavily inspired by the architecture of Google Spanner and BigTable.
 
