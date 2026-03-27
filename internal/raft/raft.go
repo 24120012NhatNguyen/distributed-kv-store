@@ -10,12 +10,14 @@ type Peer interface {
 	Call(method string, args, reply interface{}) bool
 }
 
+// Persister abstracts durable storage for Raft state.
 type Persister interface {
 	Save(raftState []byte, snapshot []byte)
 	ReadRaftState() []byte
 	RaftStateSize() int
 }
 
+// ApplyMsg is sent on ApplyCh each time a log entry is committed.
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -41,6 +43,45 @@ const (
 	Leader
 )
 
+type RequestVoteArgs struct {
+	Term         int
+	LastLogIndex int
+	LastLogTerm  int
+	CandidateID  int
+}
+
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         int        // leader's term
+	LeaderID     int        // so follower can redirect clients
+	PrevLogIndex int        // index of log entry immediately preceding new ones
+	PrevLogTerm  int        // term of prevLogIndex entry
+	Entries      []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int        // leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term    int  // currentTerm, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	XTerm   int
+	XLen    int
+	Xindex  int
+}
+
+type AppendEntries struct {
+	Args  AppendEntriesArgs
+	Reply AppendEntriesReply
+}
+
+type RequestVote struct {
+	Args  RequestVoteArgs
+	Reply RequestVoteReply
+}
+
 type Raft struct {
 	mu        sync.Mutex
 	peers     []Peer
@@ -48,7 +89,6 @@ type Raft struct {
 	me        int
 	dead      int32
 
-	// Persistent state
 	CurrentTerm int
 	VotedFor    int
 	Log         []LogEntry
@@ -65,7 +105,7 @@ type Raft struct {
 
 	// Extra
 	Role          Role
-	LastHeartbeat time.Time // check election timeout
+	LastHeartbeat time.Time // để check election timeout
 	ApplyCh       chan ApplyMsg
 }
 
@@ -79,22 +119,8 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-func (rf *Raft) persist() {
-}
-
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 {
-		return
-	}
-}
-
-func (rf *Raft) PersistBytes() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.persister.RaftStateSize()
-}
-
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	// TODO (3D)
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -122,6 +148,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.NextIndex != nil && len(rf.NextIndex) > rf.me {
 		rf.NextIndex[rf.me] = index + 1
 	}
+	rf.persist()
 	rf.mu.Unlock()
 
 	// Kick off replication immediately; don't wait for the next heartbeat.
@@ -152,7 +179,7 @@ func Make(peers []Peer, me int, persister Persister, applyCh chan ApplyMsg) *Raf
 	rf.CurrentTerm = 0
 	rf.VotedFor = -1
 	rf.LastHeartbeat = time.Now()
-	rf.Log = []LogEntry{{Term: 0}}
+	rf.Log = []LogEntry{{Term: 0}} // dummy entry index 0
 	rf.CommitIndex = 0
 	rf.LastApplied = 0
 	rf.ApplyCh = applyCh

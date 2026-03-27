@@ -4,25 +4,6 @@ import (
 	"time"
 )
 
-type AppendEntriesArgs struct {
-	Term         int        // leader's term
-	LeaderID     int        // so follower can redirect clients
-	PrevLogIndex int        // index of log entry immediately preceding new ones
-	PrevLogTerm  int        // term of prevLogIndex entry
-	Entries      []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
-	LeaderCommit int        // leader's commitIndex
-}
-
-type AppendEntriesReply struct {
-	Term    int  // currentTerm, for leader to update itself
-	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
-}
-
-type AppendEntries struct {
-	Args  AppendEntriesArgs
-	Reply AppendEntriesReply
-}
-
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -30,6 +11,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
+		rf.persist()
 		return
 	}
 	if args.Term > rf.CurrentTerm {
@@ -39,9 +21,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.Role = Follower
 	rf.LastHeartbeat = time.Now() // reset timer khi nhận được AppendEntries từ leader
 	reply.Term = rf.CurrentTerm
+	rf.persist()
 	// Rule 2: Consistency check - prevLogIndex and prevLogTerm must match
-	if args.PrevLogIndex >= len(rf.Log) || rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= len(rf.Log) {
 		reply.Success = false
+		reply.XTerm = -1
+		reply.XLen = len(rf.Log)
+		reply.Xindex = -1
+		return
+	}
+	if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.XTerm = rf.Log[args.PrevLogIndex].Term
+		reply.XLen = len(rf.Log)
+		xidx := args.PrevLogIndex
+		for xidx > 0 && rf.Log[xidx-1].Term == reply.XTerm {
+			xidx--
+		}
+		reply.Xindex = xidx
 		return
 	}
 	// Rules 3 & 4: Truncate and append new entries
@@ -50,12 +47,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if idx < len(rf.Log) {
 			// ghi đè lên
 			if rf.Log[idx].Term != entry.Term {
-				rf.Log = rf.Log[:idx]                        //  index [0, idx-1]
-				rf.Log = append(rf.Log, args.Entries[i:]...) // thay thế
+				rf.Log = rf.Log[:idx]                        // giữ lại index [0, idx-1]
+				rf.Log = append(rf.Log, args.Entries[i:]...) // thay thế phần còn lại của log
+				rf.persist()
 				break
 			}
 		} else {
 			rf.Log = append(rf.Log, args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
@@ -122,8 +121,27 @@ func (rf *Raft) replicateToFollower(server int) {
 		rf.mu.Unlock()
 
 		var reply AppendEntriesReply
-		if !rf.peers[server].Call("Raft.AppendEntries", &args, &reply) {
-			return
+		type aeResult struct {
+			ok    bool
+			reply AppendEntriesReply
+		}
+		ch := make(chan aeResult, 1)
+		go func(a AppendEntriesArgs) {
+			var r AppendEntriesReply
+			ok := rf.peers[server].Call("Raft.AppendEntries", &a, &r)
+			ch <- aeResult{ok: ok, reply: r}
+		}(args)
+		select {
+		case res := <-ch:
+			if !res.ok {
+				// Unreliable network: retry later instead of giving up.
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			reply = res.reply
+		case <-time.After(200 * time.Millisecond):
+			// Long reordering can delay RPCs; don't let one blocked call stall replication.
+			continue
 		}
 
 		rf.mu.Lock()
@@ -132,6 +150,7 @@ func (rf *Raft) replicateToFollower(server int) {
 			rf.Role = Follower
 			rf.VotedFor = -1
 			rf.LastHeartbeat = time.Now()
+			rf.persist()
 			rf.mu.Unlock()
 			return
 		}
@@ -147,8 +166,25 @@ func (rf *Raft) replicateToFollower(server int) {
 			rf.mu.Unlock()
 			return
 		}
-		if rf.NextIndex[server] > 1 {
-			rf.NextIndex[server] -= 1
+		// Conflict optimization: jump NextIndex back quickly.
+		if reply.XTerm == -1 {
+			rf.NextIndex[server] = reply.XLen
+		} else {
+			lastIndexOfTerm := -1
+			for i := len(rf.Log) - 1; i >= 0; i-- {
+				if rf.Log[i].Term == reply.XTerm {
+					lastIndexOfTerm = i
+					break
+				}
+			}
+			if lastIndexOfTerm != -1 {
+				rf.NextIndex[server] = lastIndexOfTerm + 1
+			} else {
+				rf.NextIndex[server] = reply.Xindex
+			}
+		}
+		if rf.NextIndex[server] < 1 {
+			rf.NextIndex[server] = 1
 		}
 		rf.mu.Unlock()
 		// Fast backup over inconsistent follower logs, without waiting for the next heartbeat.
@@ -188,7 +224,13 @@ func (rf *Raft) applyLoop() {
 			})
 		}
 		rf.mu.Unlock()
+		if rf.killed() {
+			return
+		}
 		for _, entry := range entries {
+			if rf.killed() {
+				return
+			}
 			rf.ApplyCh <- entry
 		}
 	}

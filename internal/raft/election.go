@@ -5,23 +5,6 @@ import (
 	"time"
 )
 
-type RequestVoteArgs struct {
-	Term         int
-	LastLogIndex int
-	LastLogTerm  int
-	CandidateID  int
-}
-
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-
-type RequestVote struct {
-	Args  RequestVoteArgs
-	Reply RequestVoteReply
-}
-
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -29,12 +12,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
+		rf.persist()
 		return
 	}
 	if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
 		rf.Role = Follower
 		rf.VotedFor = -1
+		rf.persist()
 	}
 	lastIdx := len(rf.Log) - 1
 	lastTerm := rf.Log[lastIdx].Term
@@ -53,6 +38,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted = false
 	}
+	rf.persist()
 	reply.Term = rf.CurrentTerm
 }
 
@@ -86,6 +72,7 @@ func (rf *Raft) ticker() {
 				LastLogIndex: len(rf.Log) - 1,
 				LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
 			}
+			rf.persist()
 			rf.mu.Unlock()
 			for i := range rf.peers {
 				if i != rf.me {
@@ -120,6 +107,7 @@ func (rf *Raft) ticker() {
 									rf.CurrentTerm = reply.Term
 									rf.Role = Follower
 									rf.VotedFor = -1
+									rf.persist()
 									return
 								} else {
 									return
